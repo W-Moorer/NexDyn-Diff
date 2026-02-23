@@ -1,0 +1,77 @@
+<mujoco model="gear_contact_selfcontained">
+  <compiler angle="degree" autolimits="true"/>
+
+  <extension>
+    <plugin plugin="mujoco.sdf.gear">
+      <instance name="gear1">
+        <config key="alpha" value="0"/>
+      </instance>
+    </plugin>
+    <plugin plugin="mujoco.sdf.gear">
+      <instance name="gear2">
+        <config key="alpha" value="15"/>
+      </instance>
+    </plugin>
+  </extension>
+
+  <option timestep="0.001" gravity="0 0 -9.81" sdf_iterations="5" sdf_initpoints="20"/>
+
+  <default>
+    <geom solref="0.01 1" solimp="0.95 0.99 0.0001" friction="0.2"/>
+  </default>
+
+  <asset>
+    <mesh name="gear1_mesh">
+      <plugin instance="gear1"/>
+    </mesh>
+    <mesh name="gear2_mesh">
+      <plugin instance="gear2"/>
+    </mesh>
+
+    <texture
+      name="checker"
+      type="2d"
+      builtin="checker"
+      width="256"
+      height="256"
+      rgb1="0.18 0.22 0.28"
+      rgb2="0.10 0.12 0.16"/>
+    <material
+      name="ground_mat"
+      texture="checker"
+      texrepeat="2 2"
+      texuniform="true"
+      reflectance="0.1"/>
+  </asset>
+
+  <worldbody>
+    <light name="key" pos="0 0 2" dir="0 0 -1" directional="true"/>
+    <light name="fill" pos="3 -2 2"/>
+    <camera name="overview" pos="1.4 -5.0 2.2" xyaxes="1 0 0 0 0.5 1"/>
+
+    <geom
+      name="ground"
+      type="plane"
+      size="8 8 0.1"
+      pos="0 0 -0.02"
+      material="ground_mat"/>
+
+    <body name="freewheel_body" pos="0 0 0.2">
+      <joint name="freewheel" type="hinge" axis="0 0 1" damping="1000"/>
+      <geom name="gear1" type="sdf" mesh="gear1_mesh" rgba="0.40 0.40 0.40 1">
+        <plugin instance="gear1"/>
+      </geom>
+    </body>
+
+    <body name="drive_body" pos="2.85 0 0.2">
+      <joint name="drive" type="hinge" axis="0 0 1" damping="0.1"/>
+      <geom name="gear2" type="sdf" mesh="gear2_mesh" rgba="0.70 0.70 0.70 1">
+        <plugin instance="gear2"/>
+      </geom>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="drive" joint="drive" ctrllimited="true" ctrlrange="-1 1" gear="1500"/>
+  </actuator>
+</mujoco>

@@ -1,0 +1,1900 @@
+// Copyright 2021 DeepMind Technologies Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "engine/engine_util_misc.h"
+
+#include <ctype.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <simcore/SIM_data.h>
+#include <simcore/SIM_macro.h>
+#include <simcore/SIM_model.h>
+#include "engine/engine_array_safety.h"
+#include "engine/engine_macro.h"
+#include "engine/engine_util_blas.h"
+#include "engine/engine_util_errmem.h"
+#include "engine/engine_util_spatial.h"
+
+//------------------------------ tendon wrapping ---------------------------------------------------
+
+// check for intersection of two 2D line segments
+static sim_byte_t is_intersect(const sim_scalar_t* p1, const sim_scalar_t* p2,
+                            const sim_scalar_t* p3, const sim_scalar_t* p4) {
+  sim_scalar_t a, b;
+
+  // compute determinant, check
+  sim_scalar_t det = (p4[1]-p3[1])*(p2[0]-p1[0]) - (p4[0]-p3[0])*(p2[1]-p1[1]);
+  if (sim_math_abs(det) < SIM_MINVAL) {
+    return 0;
+  }
+
+  // compute intersection point on each line
+  a = ((p4[0]-p3[0])*(p1[1]-p3[1]) - (p4[1]-p3[1])*(p1[0]-p3[0])) / det;
+  b = ((p2[0]-p1[0])*(p1[1]-p3[1]) - (p2[1]-p1[1])*(p1[0]-p3[0])) / det;
+
+  return ((a >= 0 && a <= 1 && b >= 0 && b <= 1) ? 1 : 0);
+}
+
+
+// curve length along circle
+static sim_scalar_t length_circle(const sim_scalar_t* p0, const sim_scalar_t* p1, int ind, sim_scalar_t radius) {
+  sim_scalar_t p0n[2] = {p0[0], p0[1]};
+  sim_scalar_t p1n[2] = {p1[0], p1[1]};
+
+  // compute angle between 0 and pi
+  sim_math_normalize(p0n, 2);
+  sim_math_normalize(p1n, 2);
+  sim_scalar_t angle = sim_math_acos(sim_math_dot(p0n, p1n, 2));
+
+  // flip if necessary
+  sim_scalar_t cross = p0[1]*p1[0]-p0[0]*p1[1];
+  if ((cross > 0 && ind) || (cross < 0 && !ind)) {
+    angle = 2*SIM_PI - angle;
+  }
+
+  return radius*angle;
+}
+
+
+// 2D circle wrap
+//  input:  pair of 2D endpoints in end[4], optional 2D side point in side[2], radius
+//  output: return length of circular wrap or -1
+//          pair of 2D points in pnt[4]
+static sim_scalar_t wrap_circle(sim_scalar_t pnt[4], const sim_scalar_t end[4], const sim_scalar_t* side, sim_scalar_t radius) {
+  sim_scalar_t sqlen0 = end[0]*end[0] + end[1]*end[1];
+  sim_scalar_t sqlen1 = end[2]*end[2] + end[3]*end[3];
+  sim_scalar_t sqrad = radius*radius;
+
+  // either point inside circle or circle too small: no wrap
+  if (sqlen0 < sqrad || sqlen1 < sqrad || radius < SIM_MINVAL) {
+    return -1;
+  }
+
+  // points too close: no wrap
+  sim_scalar_t dif[2] = {end[2]-end[0], end[3]-end[1]};
+  sim_scalar_t dd = dif[0]*dif[0] + dif[1]*dif[1];
+  if (dd < SIM_MINVAL) {
+    return -1;
+  }
+
+  // find nearest point on line segment to origin: a*dif + d0
+  sim_scalar_t a = -(dif[0]*end[0]+dif[1]*end[1])/dd;
+  if (a < 0) {
+    a = 0;
+  } else if (a > 1) {
+    a = 1;
+  }
+
+  // check for intersection and side
+  sim_scalar_t tmp[2] = {a*dif[0] + end[0], a*dif[1] + end[1]};
+  if (tmp[0]*tmp[0]+tmp[1]*tmp[1] > sqrad && (!side || sim_math_dot(side, tmp, 2) >= 0)) {
+    return -1;
+  }
+
+  sim_scalar_t sqrt0 = sim_math_sqrt(sqlen0 - sqrad);
+  sim_scalar_t sqrt1 = sim_math_sqrt(sqlen1 - sqrad);
+
+  // construct the two solutions, compute goodness
+  sim_scalar_t sol[2][2][2], good[2];
+  for (int i=0; i < 2; i++) {
+    int sgn = (i == 0 ? 1 : -1);
+
+    sol[i][0][0] = (end[0]*sqrad + sgn*radius*end[1]*sqrt0)/sqlen0;
+    sol[i][0][1] = (end[1]*sqrad - sgn*radius*end[0]*sqrt0)/sqlen0;
+    sol[i][1][0] = (end[2]*sqrad - sgn*radius*end[3]*sqrt1)/sqlen1;
+    sol[i][1][1] = (end[3]*sqrad + sgn*radius*end[2]*sqrt1)/sqlen1;
+
+    // goodness: close to sd, or shorter path
+    if (side) {
+      sim_math_add(tmp, sol[i][0], sol[i][1], 2);
+      sim_math_normalize(tmp, 2);
+      good[i] = sim_math_dot(tmp, side, 2);
+    } else {
+      sim_math_sub(tmp, sol[i][0], sol[i][1], 2);
+      good[i] = -sim_math_dot(tmp, tmp, 2);
+    }
+
+    // penalize for intersection
+    if (is_intersect(end, sol[i][0], end+2, sol[i][1])) {
+      good[i] = -10000;
+    }
+  }
+
+  // select the better solution
+  int i = (good[0] > good[1] ? 0 : 1);
+  pnt[0] = sol[i][0][0];
+  pnt[1] = sol[i][0][1];
+  pnt[2] = sol[i][1][0];
+  pnt[3] = sol[i][1][1];
+
+  // check for intersection
+  if (is_intersect(end, pnt, end+2, pnt+2)) {
+    return -1;
+  }
+
+  // return curve length
+  return length_circle(sol[i][0], sol[i][1], i, radius);
+}
+
+
+// 2D inside wrap
+//  input: pair of 2D endpoints in end[4], radius
+//  output: pair of 2D points in pnt[4]; return 0 if wrap, -1 if no wrap
+static sim_scalar_t wrap_inside(sim_scalar_t pnt[4], const sim_scalar_t end[4], sim_scalar_t radius) {
+  // algorithm parameters
+  const int maxiter = 20;
+  const sim_scalar_t zinit = 1 - 1e-7;
+  const sim_scalar_t tolerance = 1e-6;
+
+  // constants
+  sim_scalar_t len0 = sim_math_norm(end, 2);
+  sim_scalar_t len1 = sim_math_norm(end+2, 2);
+  sim_scalar_t dif[2] = {end[2]-end[0], end[3]-end[1]};
+  sim_scalar_t dd = dif[0]*dif[0] + dif[1]*dif[1];
+
+  // either point inside circle or circle too small: no wrap
+  if (len0 <= radius || len1 <= radius || radius < SIM_MINVAL || len0 < SIM_MINVAL || len1 < SIM_MINVAL) {
+    return -1;
+  }
+
+  // segment-circle intersection: no wrap
+  if (dd > SIM_MINVAL) {
+    // find nearest point on line segment to origin: d0 + a*dif
+    sim_scalar_t a = -(dif[0]*end[0] + dif[1]*end[1]) / dd;
+
+    // in segment
+    if (a > 0 && a < 1) {
+      sim_scalar_t tmp[2];
+      sim_math_addScl(tmp, end, dif, a, 2);
+      if (sim_math_norm(tmp, 2) <= radius) {
+        return -1;
+      }
+    }
+  }
+
+  // prepare default in case of numerical failure: average
+  pnt[0] = 0.5*(end[0] + end[2]);
+  pnt[1] = 0.5*(end[1] + end[3]);
+  sim_math_normalize(pnt, 2);
+  sim_math_scl(pnt, pnt, radius, 2);
+  pnt[2] = pnt[0];
+  pnt[3] = pnt[1];
+
+  // compute function parameters: asin(A*z) + asin(B*z) - 2*asin(z) + G = 0
+  sim_scalar_t A = radius/len0;
+  sim_scalar_t B = radius/len1;
+  sim_scalar_t cosG = (len0*len0 + len1*len1 - dd) / (2*len0*len1);
+  if (cosG < -1+SIM_MINVAL) {
+    return -1;
+  } else if (cosG > 1-SIM_MINVAL) {
+    return 0;
+  }
+  sim_scalar_t G = sim_math_acos(cosG);
+
+  // init
+  sim_scalar_t z = zinit;
+  sim_scalar_t f = sim_math_asin(A*z) + sim_math_asin(B*z) - 2*sim_math_asin(z) + G;
+
+  // make sure init is not on the other side
+  if (f > 0) {
+    return 0;
+  }
+
+  // Newton method
+  int iter;
+  for (iter=0; iter < maxiter && sim_math_abs(f) > tolerance; iter++) {
+    // derivative
+    sim_scalar_t df = A/sim_math_max(SIM_MINVAL, sim_math_sqrt(1-z*z*A*A)) +
+                B/sim_math_max(SIM_MINVAL, sim_math_sqrt(1-z*z*B*B)) -
+                2/sim_math_max(SIM_MINVAL, sim_math_sqrt(1-z*z));
+
+    // check sign; SHOULD NOT OCCUR
+    if (df > -SIM_MINVAL) {
+      return 0;
+    }
+
+    // new point
+    sim_scalar_t z1 = z - f/df;
+
+    // make sure we are moving to the left; SHOULD NOT OCCUR
+    if (z1 > z) {
+      return 0;
+    }
+
+    // update solution
+    z = z1;
+    f = sim_math_asin(A*z) + sim_math_asin(B*z) - 2*sim_math_asin(z) + G;
+
+    // exit if positive; SHOULD NOT OCCUR
+    if (f > tolerance) {
+      return 0;
+    }
+  }
+
+  // check convergence
+  if (iter >= maxiter) {
+    return 0;
+  }
+
+  // finalize: rotation by ang from vec = a or b, depending on cross(a,b) sign
+  sim_scalar_t vec[2];
+  sim_scalar_t ang;
+  if (end[0]*end[3] - end[1]*end[2] > 0) {
+    sim_math_copy(vec, end, 2);
+    ang = sim_math_asin(z) - sim_math_asin(A*z);
+  } else {
+    sim_math_copy(vec, end+2, 2);
+    ang = sim_math_asin(z) - sim_math_asin(B*z);
+  }
+  sim_math_normalize(vec, 2);
+  pnt[0] = radius*(sim_math_cos(ang)*vec[0] - sim_math_sin(ang)*vec[1]);
+  pnt[1] = radius*(sim_math_sin(ang)*vec[0] + sim_math_cos(ang)*vec[1]);
+  pnt[2] = pnt[0];
+  pnt[3] = pnt[1];
+
+  return 0;
+}
+
+
+// wrap tendons around spheres and cylinders
+//  input:  x0, x1: pair of 3D endpoints
+//          xpos, xmat, radius: position, orientation and radius of geom
+//          type: wrap type (SIM_tWrap)
+//          side: 3D position of sidesite
+//  output: return wrap length, -1 if no wrap
+//          wpnt: pair of 3D wrap points
+sim_scalar_t sim_math_wrap(sim_scalar_t wpnt[6], const sim_scalar_t x0[3], const sim_scalar_t x1[3],
+                const sim_scalar_t xpos[3], const sim_scalar_t xmat[9], sim_scalar_t radius,
+                int type, const sim_scalar_t side[3]) {
+  // check object type;  SHOULD NOT OCCUR
+  if (type != SIM_WRAP_SPHERE && type != SIM_WRAP_CYLINDER) {
+    SIM_ERROR("unknown wrapping object type %d", type);
+  }
+
+  // map sites to wrap object's local frame
+  sim_scalar_t tmp[3];
+  sim_math_sub_3(tmp, x0, xpos);
+  sim_scalar_t p[2][3];
+  sim_math_mulMatTVec3(p[0], xmat, tmp);
+  sim_math_sub_3(tmp, x1, xpos);
+  sim_math_mulMatTVec3(p[1], xmat, tmp);
+
+  // too close to origin: return
+  if (sim_math_norm3(p[0]) < SIM_MINVAL || sim_math_norm3(p[1]) < SIM_MINVAL) {
+    return -1;
+  }
+
+  // construct 2D frame for circle wrap
+  sim_scalar_t axis[2][3];
+  if (type == SIM_WRAP_SPHERE) {
+    // 1st axis = p0
+    sim_math_copy_3(axis[0], p[0]);
+    sim_math_normalize_3(axis[0]);
+
+    // normal to p0-0-p1 plane = cross(p0, p1)
+    sim_scalar_t normal[3];
+    sim_math_cross(normal, p[0], p[1]);
+    sim_scalar_t nrm = sim_math_normalize_3(normal);
+
+    // if (p0, p1) parallel: different normal
+    if (nrm < SIM_MINVAL) {
+      // find max component of axis0
+      int i = 0;
+      if (sim_math_abs(axis[0][1]) > sim_math_abs(axis[0][0]) &&
+          sim_math_abs(axis[0][1]) > sim_math_abs(axis[0][2])) {
+        i = 1;
+      }
+      if (sim_math_abs(axis[0][2]) > sim_math_abs(axis[0][0]) &&
+          sim_math_abs(axis[0][2]) > sim_math_abs(axis[0][1])) {
+        i = 2;
+      }
+
+      // init second axis: 0 at i; 1 elsewhere
+      axis[1][0] = 1;
+      axis[1][1] = 1;
+      axis[1][2] = 1;
+      axis[1][i] = 0;
+
+      // recompute normal
+      sim_math_cross(normal, axis[0], axis[1]);
+      sim_math_normalize_3(normal);
+    }
+
+    // 2nd axis = cross(normal, p0)
+    sim_math_cross(axis[1], normal, axis[0]);
+    sim_math_normalize_3(axis[1]);
+  } else {
+    // 1st axis = x
+    axis[0][0] = 1;
+    axis[0][1] = axis[0][2] = 0;
+
+    // 2nd axis = y
+    axis[1][1] = 1;
+    axis[1][0] = axis[1][2] = 0;
+  }
+
+  // project points in 2D frame: p => d
+  sim_scalar_t s[3], d[4], sd[2];
+  d[0] = sim_math_dot_3(p[0], axis[0]);
+  d[1] = sim_math_dot_3(p[0], axis[1]);
+  d[2] = sim_math_dot_3(p[1], axis[0]);
+  d[3] = sim_math_dot_3(p[1], axis[1]);
+
+  // handle sidesite
+  if (side) {
+    // side point: apply same projection as x0, x1
+    sim_math_sub_3(tmp, side, xpos);
+    sim_math_mulMatTVec3(s, xmat, tmp);
+
+    // side point: project and rescale
+    sd[0] = sim_math_dot_3(s, axis[0]);
+    sd[1] = sim_math_dot_3(s, axis[1]);
+    sim_math_normalize(sd, 2);
+    sim_math_scl(sd, sd, radius, 2);
+  }
+
+  // apply inside wrap
+  sim_scalar_t wlen;
+  sim_scalar_t pnt[4];
+  if (side && sim_math_norm3(s) < radius) {
+    wlen = wrap_inside(pnt, d, radius);
+  }
+
+  // apply circle wrap
+  else {
+    wlen = wrap_circle(pnt, d, (side ? sd : NULL), radius);
+  }
+
+  // no wrap: return
+  if (wlen < 0) {
+    return -1;
+  }
+
+  // reconstruct 3D points in local frame: res
+  sim_scalar_t res[6];
+  for (int i=0; i < 2; i++) {
+    // res = axis0*d0 + axis1*d1
+    sim_math_scale_3(res+3*i, axis[0], pnt[2*i]);
+    sim_math_scale_3(tmp, axis[1], pnt[2*i+1]);
+    sim_math_add_to_3(res+3*i, tmp);
+  }
+
+  // cylinder: correct along z
+  if (type == SIM_WRAP_CYLINDER) {
+    // set vertical coordinates
+    sim_scalar_t L0 = sim_math_sqrt((p[0][0]-res[0])*(p[0][0]-res[0]) + (p[0][1]-res[1])*(p[0][1]-res[1]));
+    sim_scalar_t L1 = sim_math_sqrt((p[1][0]-res[3])*(p[1][0]-res[3]) + (p[1][1]-res[4])*(p[1][1]-res[4]));
+    res[2] = p[0][2] + (p[1][2] - p[0][2])*L0 / (L0+wlen+L1);
+    res[5] = p[0][2] + (p[1][2] - p[0][2])*(L0+wlen) / (L0+wlen+L1);
+
+    // correct wlen for height
+    sim_scalar_t height = sim_math_abs(res[5] - res[2]);
+    wlen = sim_math_sqrt(wlen*wlen + height*height);
+  }
+
+  // map back to global frame: wpnt
+  sim_math_mul_mat_vec_3(wpnt, xmat, res);
+  sim_math_mul_mat_vec_3(wpnt+3, xmat, res+3);
+  sim_math_add_to_3(wpnt, xpos);
+  sim_math_add_to_3(wpnt+3, xpos);
+
+  return wlen;
+}
+
+
+//------------------------------ misc geometry -----------------------------------------------------
+
+// all 3 semi-axes of a geom
+void sim_math_geomSemiAxes(sim_scalar_t semiaxes[3], const sim_scalar_t size[3], SIM_tGeom type) {
+  switch (type) {
+  case SIM_GEOM_SPHERE:
+    semiaxes[0] = size[0];
+    semiaxes[1] = size[0];
+    semiaxes[2] = size[0];
+    break;
+
+  case SIM_GEOM_CAPSULE:
+    semiaxes[0] = size[0];
+    semiaxes[1] = size[0];
+    semiaxes[2] = size[1] + size[0];
+    break;
+
+  case SIM_GEOM_CYLINDER:
+    semiaxes[0] = size[0];
+    semiaxes[1] = size[0];
+    semiaxes[2] = size[1];
+    break;
+
+  default:
+    semiaxes[0] = size[0];
+    semiaxes[1] = size[1];
+    semiaxes[2] = size[2];
+  }
+}
+
+
+// return 1 if point is inside a primitive geom, 0 otherwise
+int sim_math_insideGeom(const sim_scalar_t pos[3], const sim_scalar_t mat[9], const sim_scalar_t size[3], SIM_tGeom type,
+                   const sim_scalar_t point[3]) {
+  // vector from geom to point
+  sim_scalar_t vec[3];
+  sim_math_sub_3(vec, point, pos);
+
+  // quick return for spheres, frame rotation not required
+  if (type == SIM_GEOM_SPHERE) {
+    return sim_math_dot_3(vec, vec) < size[0]*size[0];
+  }
+
+  // rotate into local frame
+  sim_scalar_t plocal[3];
+  sim_math_mulMatTVec3(plocal, mat, vec);
+
+  // handle other geom types
+  switch (type) {
+  case SIM_GEOM_CAPSULE: {
+    sim_scalar_t z = plocal[2];
+    sim_scalar_t z_clamped = sim_math_clip(z, -size[1], size[1]);
+    sim_scalar_t z_dist_sq = (z - z_clamped) * (z - z_clamped);
+    return (plocal[0]*plocal[0] + plocal[1]*plocal[1] + z_dist_sq < size[0]*size[0]);
+  }
+
+  case SIM_GEOM_ELLIPSOID:
+    return (plocal[0]*plocal[0]/(size[0]*size[0]) +
+            plocal[1]*plocal[1]/(size[1]*size[1]) +
+            plocal[2]*plocal[2]/(size[2]*size[2]) < 1);
+
+  case SIM_GEOM_CYLINDER:
+    return (sim_math_abs(plocal[2]) < size[1] &&
+            plocal[0]*plocal[0] + plocal[1]*plocal[1] < size[0]*size[0]);
+
+  case SIM_GEOM_BOX:
+    return (sim_math_abs(plocal[0]) < size[0] &&
+            sim_math_abs(plocal[1]) < size[1] &&
+            sim_math_abs(plocal[2]) < size[2]);
+
+  case SIM_GEOM_PLANE:
+    return plocal[2] < 0;
+
+  default:
+    return 0;
+  }
+}
+
+
+// compute ray origin and direction for pixel (col, row) in camera image
+// for perspective: origin is unchanged, direction is computed
+// for orthographic: direction is -Z in camera frame, origin is offset from camera center
+void sim_math_camPixelRay(sim_scalar_t origin[3], sim_scalar_t direction[3],
+                     const sim_scalar_t cam_xpos[3], const sim_scalar_t cam_xmat[9],
+                     int col, int row, sim_scalar_t fx, sim_scalar_t fy, sim_scalar_t cx, sim_scalar_t cy,
+                     int projection, sim_scalar_t ortho_extent) {
+  // pixel center (row 0 = top of image)
+  sim_scalar_t px = col + 0.5 - cx;
+  sim_scalar_t py = row + 0.5 - cy;
+
+  if (projection == SIM_PROJ_PERSPECTIVE) {
+    // origin is camera position
+    sim_math_copy_3(origin, cam_xpos);
+
+    // direction in camera frame: (x/fx, -y/fy, -1), then normalized
+    sim_scalar_t dir_cam[3] = {px / fx, -py / fy, -1.0};
+    sim_math_mul_mat_vec_3(direction, cam_xmat, dir_cam);
+    sim_math_normalize_3(direction);
+  } else {
+    // orthographic: parallel rays, direction is -Z in camera frame
+    direction[0] = -cam_xmat[2];
+    direction[1] = -cam_xmat[5];
+    direction[2] = -cam_xmat[8];
+
+    // origin offset in camera frame (ortho_extent is full height, use half for each side)
+    sim_scalar_t half_extent = ortho_extent / 2;
+    sim_scalar_t offset_cam[3] = {px / fx * half_extent, -py / fy * half_extent, 0};
+    sim_scalar_t offset_world[3];
+    sim_math_mul_mat_vec_3(offset_world, cam_xmat, offset_cam);
+    sim_math_add3(origin, cam_xpos, offset_world);
+  }
+}
+
+
+// ----------------------------- flex interpolation ------------------------------------------------
+
+sim_scalar_t static inline phi(sim_scalar_t s, int i, int order) {
+  if (order == 1) {
+    return i == 0 ? 1 - s : s;
+  } else if (order == 2) {
+    switch (i) {
+      case 0:
+        return 2 * s * s - 3 * s + 1;
+      case 1:
+        return 4 * (s - s * s);
+      case 2:
+        return 2 * s * s - s;
+      default:
+        SIM_ERROR("invalid index %d", i);
+        return 0;
+    }
+  } else {
+    SIM_ERROR("order must be 1 or 2");
+    return 0;
+  }
+}
+
+sim_scalar_t static inline dphi(sim_scalar_t s, int i, int order) {
+  if (order == 1) {
+    return i == 0 ? -1 : 1;
+  } else if (order == 2) {
+    switch (i) {
+      case 0:
+        return 4 * s - 3;
+      case 1:
+        return 4 * (1 - 2 * s);
+      case 2:
+        return 4 * s - 1;
+      default:
+        SIM_ERROR("invalid index %d, must be 0, 1, or 2", i);
+        return 0;
+    }
+  } else {
+    SIM_ERROR("order must be 1 or 2");
+    return 0;
+  }
+}
+
+// evaluate the deformation gradient at p using the nodal dof values
+void sim_math_defGradient(sim_scalar_t res[9], const sim_scalar_t p[3], const sim_scalar_t* dof, int order) {
+  int idx = 0;
+  sim_scalar_t gradient[3];
+  sim_math_zero(res, 9);
+  for (int i = 0; i <= order; i++) {
+    for (int j = 0; j <= order; j++) {
+      for (int k = 0; k <= order; k++) {
+        gradient[0] = dphi(p[0], i, order) *  phi(p[1], j, order) *  phi(p[2], k, order);
+        gradient[1] =  phi(p[0], i, order) * dphi(p[1], j, order) *  phi(p[2], k, order);
+        gradient[2] =  phi(p[0], i, order) *  phi(p[1], j, order) * dphi(p[2], k, order);
+        res[0] += dof[3*idx+0] * gradient[0];
+        res[1] += dof[3*idx+0] * gradient[1];
+        res[2] += dof[3*idx+0] * gradient[2];
+        res[3] += dof[3*idx+1] * gradient[0];
+        res[4] += dof[3*idx+1] * gradient[1];
+        res[5] += dof[3*idx+1] * gradient[2];
+        res[6] += dof[3*idx+2] * gradient[0];
+        res[7] += dof[3*idx+2] * gradient[1];
+        res[8] += dof[3*idx+2] * gradient[2];
+        idx++;
+      }
+    }
+  }
+}
+
+// evaluate the basis function at x for the i-th node
+sim_scalar_t sim_math_evalBasis(const sim_scalar_t x[3], int i, int order) {
+  if (order == 1) {
+    return phi(x[2], i&1, order) * phi(x[1], i&2, order) * phi(x[0], i&4, order);
+  } else if (order == 2) {
+    return phi(x[2], i % 3, order) * phi(x[1], (i / 3) % 3, order) * phi(x[0], i / 9, order);
+  } else {
+    return -1;
+  }
+}
+
+// interpolate a function at x with given interpolation coefficients and order n
+void sim_math_interpolate3D(sim_scalar_t res[3], const sim_scalar_t x[3], const sim_scalar_t* coeff, int order) {
+  int npoint = (order + 1) * (order + 1) * (order + 1);
+  for (int j=0; j < npoint; j++) {
+    sim_math_add_to_scale_3(res, coeff+3*j, sim_math_evalBasis(x, j, order));
+  }
+}
+
+
+//------------------------------ actuator models ---------------------------------------------------
+
+// normalized muscle length-gain curve
+sim_scalar_t sim_math_muscleGainLength(sim_scalar_t length, sim_scalar_t lmin, sim_scalar_t lmax) {
+  if (lmin <= length && length <= lmax) {
+    // mid-ranges (maximum is at 1.0)
+    sim_scalar_t a = 0.5*(lmin+1);
+    sim_scalar_t b = 0.5*(1+lmax);
+
+    if (length <= a) {
+      sim_scalar_t x = (length-lmin) / SIM_MAX(SIM_MINVAL, a-lmin);
+      return 0.5*x*x;
+    } else if (length <= 1) {
+      sim_scalar_t x = (1-length) / SIM_MAX(SIM_MINVAL, 1-a);
+      return 1 - 0.5*x*x;
+    } else if (length <= b) {
+      sim_scalar_t x = (length-1) / SIM_MAX(SIM_MINVAL, b-1);
+      return 1 - 0.5*x*x;
+    } else {
+      sim_scalar_t x = (lmax-length) / SIM_MAX(SIM_MINVAL, lmax-b);
+      return 0.5*x*x;
+    }
+  }
+
+  return 0.0;
+}
+
+
+// muscle active force, prm = (range[2], force, scale, lmin, lmax, vmax, fpmax, fvmax)
+sim_scalar_t sim_math_muscleGain(sim_scalar_t len, sim_scalar_t vel, const sim_scalar_t lengthrange[2],
+                      sim_scalar_t acc0, const sim_scalar_t prm[9]) {
+  // unpack parameters
+  sim_scalar_t range[2] = {prm[0], prm[1]};
+  sim_scalar_t force    = prm[2];
+  sim_scalar_t scale    = prm[3];
+  sim_scalar_t lmin     = prm[4];
+  sim_scalar_t lmax     = prm[5];
+  sim_scalar_t vmax     = prm[6];
+  sim_scalar_t fvmax    = prm[8];
+
+  // scale force if negative
+  if (force < 0) {
+    force = scale / SIM_MAX(SIM_MINVAL, acc0);
+  }
+
+  // optimum length
+  sim_scalar_t L0 = (lengthrange[1]-lengthrange[0]) / SIM_MAX(SIM_MINVAL, range[1]-range[0]);
+
+  // normalized length and velocity
+  sim_scalar_t L = range[0] + (len-lengthrange[0]) / SIM_MAX(SIM_MINVAL, L0);
+  sim_scalar_t V = vel / SIM_MAX(SIM_MINVAL, L0*vmax);
+
+  // length curve
+  sim_scalar_t FL = sim_math_muscleGainLength(L, lmin, lmax);
+
+  // velocity curve
+  sim_scalar_t FV;
+  sim_scalar_t y = fvmax-1;
+  if (V <= -1) {
+    FV = 0;
+  } else if (V <= 0) {
+    FV = (V+1)*(V+1);
+  } else if (V <= y) {
+    FV = fvmax - (y-V)*(y-V) / SIM_MAX(SIM_MINVAL, y);
+  } else {
+    FV = fvmax;
+  }
+
+  // compute FVL and scale, make it negative
+  return -force*FL*FV;
+}
+
+
+// muscle passive force, prm = (range[2], force, scale, lmin, lmax, vmax, fpmax, fvmax)
+sim_scalar_t sim_math_muscleBias(sim_scalar_t len, const sim_scalar_t lengthrange[2],
+                      sim_scalar_t acc0, const sim_scalar_t prm[9]) {
+  // unpack parameters
+  sim_scalar_t range[2] = {prm[0], prm[1]};
+  sim_scalar_t force    = prm[2];
+  sim_scalar_t scale    = prm[3];
+  sim_scalar_t lmax     = prm[5];
+  sim_scalar_t fpmax    = prm[7];
+
+  // scale force if negative
+  if (force < 0) {
+    force = scale / SIM_MAX(SIM_MINVAL, acc0);
+  }
+
+  // optimum length
+  sim_scalar_t L0 = (lengthrange[1]-lengthrange[0]) / SIM_MAX(SIM_MINVAL, range[1]-range[0]);
+
+  // normalized length
+  sim_scalar_t L = range[0] + (len-lengthrange[0]) / SIM_MAX(SIM_MINVAL, L0);
+
+  // half-quadratic to (L0+lmax)/2, linear beyond
+  sim_scalar_t b = 0.5*(1+lmax);
+  if (L <= 1) {
+    return 0;
+  } else if (L <= b) {
+    sim_scalar_t x = (L-1) / SIM_MAX(SIM_MINVAL, b-1);
+    return -force*fpmax*0.5*x*x;
+  } else {
+    sim_scalar_t x = (L-b) / SIM_MAX(SIM_MINVAL, b-1);
+    return -force*fpmax*(0.5 + x);
+  }
+}
+
+
+// muscle time constant with optional smoothing
+sim_scalar_t sim_math_muscleDynamicsTimescale(sim_scalar_t dctrl, sim_scalar_t tau_act, sim_scalar_t tau_deact,
+                                   sim_scalar_t smoothing_width) {
+  sim_scalar_t tau;
+
+  // hard switching
+  if (smoothing_width < SIM_MINVAL) {
+    tau = dctrl > 0 ? tau_act : tau_deact;
+  }
+
+  // smooth switching
+  else {
+    // scale by width, center around 0.5 midpoint, rescale to bounds
+    tau = tau_deact + (tau_act-tau_deact)*sim_math_sigmoid(dctrl/smoothing_width + 0.5);
+  }
+  return tau;
+}
+
+
+// muscle activation dynamics, prm = (tau_act, tau_deact, smoothing_width)
+sim_scalar_t sim_math_muscleDynamics(sim_scalar_t ctrl, sim_scalar_t act, const sim_scalar_t prm[3]) {
+  // clamp control
+  sim_scalar_t ctrlclamp = sim_math_clip(ctrl, 0, 1);
+
+  // clamp activation
+  sim_scalar_t actclamp = sim_math_clip(act, 0, 1);
+
+  // compute timescales as in Millard et al. (2013) https://doi.org/10.1115/1.4023390
+  sim_scalar_t tau_act = prm[0] * (0.5 + 1.5*actclamp);    // activation timescale
+  sim_scalar_t tau_deact = prm[1] / (0.5 + 1.5*actclamp);  // deactivation timescale
+  sim_scalar_t smoothing_width = prm[2];                   // width of smoothing sigmoid
+  sim_scalar_t dctrl = ctrlclamp - act;                    // excess excitation
+
+  sim_scalar_t tau = sim_math_muscleDynamicsTimescale(dctrl, tau_act, tau_deact, smoothing_width);
+
+  // filter output
+  return dctrl / SIM_MAX(SIM_MINVAL, tau);
+}
+
+
+//---------------------------------------- Base64 --------------------------------------------------
+
+// decoding function for Base64
+static uint32_t _decode(char ch) {
+  if (ch >= 'A' && ch <= 'Z') {
+    return ch - 'A';
+  }
+
+  if (ch >= 'a' && ch <= 'z') {
+    return (ch - 'a') + 26;
+  }
+
+  if (ch >= '0' && ch <= '9') {
+    return (ch - '0') + 52;
+  }
+
+  if (ch == '+') {
+    return 62;
+  }
+
+  if (ch == '/') {
+    return 63;
+  }
+
+  return 0;
+}
+
+
+// encode data as Base64 into buf (including padding and null char)
+// returns number of chars written in buf: 4 * [(ndata + 2) / 3] + 1
+size_t sim_math_encodeBase64(char* buf, const uint8_t* data, size_t ndata) {
+  static const char *table =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  int i = 0, j = 0;
+
+  // loop over 24 bit chunks
+  while (i + 3 <= ndata) {
+    // take next 24 bit chunk (3 bytes)
+    uint32_t byte_1 = data[i++];
+    uint32_t byte_2 = data[i++];
+    uint32_t byte_3 = data[i++];
+
+    // merge bytes into one 32 bit int
+    uint32_t k = (byte_1 << 16) | (byte_2 << 8) | byte_3;
+
+    // encode 6 bit chucks into four chars
+    buf[j++] = table[(k >> 18) & 63];
+    buf[j++] = table[(k >> 12) & 63];
+    buf[j++] = table[(k >>  6) & 63];
+    buf[j++] = table[(k >>  0) & 63];
+  }
+
+  // one byte left
+  if (i + 1 == ndata) {
+    uint32_t byte_1 = data[i];
+    uint32_t k = byte_1 << 16;
+    buf[j++] = table[(k >> 18) & 63];
+    buf[j++] = table[(k >> 12) & 63];
+    buf[j++] = '=';  // padding
+    buf[j++] = '=';  // padding
+  }
+
+  // two bytes left
+  if (i + 2 == ndata) {
+    uint32_t byte_1 = data[i++];
+    uint32_t byte_2 = data[i];
+
+    uint32_t k = (byte_1 << 16) + (byte_2 << 8);
+
+    buf[j++] = table[(k >> 18) & 63];
+    buf[j++] = table[(k >> 12) & 63];
+    buf[j++] = table[(k >>  6) & 63];
+    buf[j++] = '=';  // padding
+  }
+
+  buf[j] = '\0';
+  return 4 * ((ndata + 2) / 3) + 1;
+}
+
+
+// return size in decoded bytes if s is a valid Base64 encoding
+// return 0 if s is empty or invalid Base64 encoding
+size_t sim_math_isValidBase64(const char* s) {
+  size_t i = 0;
+  int pad = 0;  // 0, 1, or 2 zero padding at the end of s
+
+  // validate chars
+  for (; s[i] && s[i] != '='; i++) {
+    if (!isalnum(s[i]) && s[i] != '/' && s[i] != '+') {
+      return 0;
+    }
+  }
+
+  // padding at end
+  if (s[i] == '=') {
+    if (!s[i + 1]) {
+      pad = 1;  // one '=' padding at end
+    } else if (s[i + 1] == '=' && !s[i + 2]) {
+      pad = 2;  // two '=' padding at end
+    } else {
+      return 0;
+    }
+  }
+
+  // strlen(s) must be a multiple of 4
+  int len = i + pad;
+  return len % 4 ? 0 : 3 * (len / 4) - pad;
+}
+
+
+// decode valid Base64 in string s into buf, undefined behavior if s is not valid Base64
+// returns number of bytes decoded (upper limit of 3 * (strlen(s) / 4))
+size_t sim_math_decodeBase64(uint8_t* buf, const char* s) {
+  size_t i = 0, j = 0;
+
+  // loop over 24 bit chunks
+  while (s[i] != '\0') {
+    // take next 24 bit chuck (4 chars; 6 bits each)
+    uint32_t char_1 = _decode(s[i++]);
+    uint32_t char_2 = _decode(s[i++]);
+    uint32_t char_3 = _decode(s[i++]);
+    uint32_t char_4 = _decode(s[i++]);
+
+    // merge into 32 bit int
+    uint32_t k = (char_1 << 18) | (char_2 << 12) | (char_3 << 6) | char_4;
+
+
+    // write up to three bytes (exclude padding at end)
+    buf[j++] = (k >> 16) & 0xFF;
+    if (s[i - 2] != '=') {
+      buf[j++] = (k >> 8) & 0xFF;
+    }
+    if (s[i - 1] != '=') {
+      buf[j++] =  k & 0xFF;
+    }
+  }
+  return j;
+}
+
+
+//------------------------------ history buffers ---------------------------------------------------
+
+// convert logical index (0=oldest, n-1=newest) to physical index
+// cursor points to the newest element (logical index n-1)
+static inline int historyPhysicalIndex(int cursor, int n, int logical) {
+  return (cursor + 1 + logical) % n;
+}
+
+
+// find logical index i such that times[i-1] < t <= times[i], using circular binary search
+// returns 0 if t <= times[oldest], n if t > times[newest]
+// cursor points to the newest element (logical index n-1)
+static int historyFindIndex(const sim_scalar_t* times, int n, int cursor, sim_scalar_t t) {
+  // get oldest and newest timestamps
+  int oldest_phys = historyPhysicalIndex(cursor, n, 0);
+  int newest_phys = historyPhysicalIndex(cursor, n, n-1);
+  sim_scalar_t t_oldest = times[oldest_phys];
+  sim_scalar_t t_newest = times[newest_phys];
+
+  // before or at first element
+  if (t <= t_oldest) {
+    return 0;
+  }
+
+  // after last element
+  if (t > t_newest) {
+    return n;
+  }
+
+  // circular binary search: find smallest logical i such that times[phys(i)] >= t
+  int lo = 0;
+  int hi = n - 1;
+  while (hi - lo > 1) {
+    int mid = (lo + hi) / 2;
+    int mid_phys = historyPhysicalIndex(cursor, n, mid);
+    if (times[mid_phys] < t) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+
+  return hi;
+}
+
+
+// initialize history buffer with given times and values; times must be strictly increasing
+// buffer layout: [user(1), cursor(1), times(n), values(n*dim)]
+void sim_math_historyInit(sim_scalar_t* buf, int n, int dim, const sim_scalar_t* times, const sim_scalar_t* values,
+                     sim_scalar_t user) {
+  // check strict monotonicity of times
+  for (int i = 0; i < n-1; i++) {
+    if (times[i+1] - times[i] < SIM_MINVAL) {
+      SIM_ERROR("times must be strictly increasing, got times[%d]=%g >= times[%d]=%g",
+              i, times[i], i+1, times[i+1]);
+    }
+  }
+
+  // buf layout: [user(1), cursor(1), times(n), values(n*dim)]
+  buf[0] = user;           // user value
+  buf[1] = (sim_scalar_t)(n-1);  // cursor points to newest (logical index n-1 = physical index n-1)
+
+  sim_scalar_t* buf_times = buf + 2;
+  sim_scalar_t* buf_values = buf + 2 + n;
+
+  if (times != buf_times) sim_math_copy(buf_times, times, n);
+  if (values) sim_math_copy(buf_values, values, n*dim);
+}
+
+
+// find insertion slot for time t, maintaining sorted order
+// if t matches an existing timestamp, returns pointer to that slot
+// if a new sample is inserted, the oldest sample is dropped
+// returns pointer to value slot where caller should write dim values
+sim_scalar_t* sim_math_historyInsert(sim_scalar_t* buf, int n, int dim, sim_scalar_t t) {
+  int cursor = (int)buf[1];
+  sim_scalar_t* times = buf + 2;
+  sim_scalar_t* values = buf + 2 + n;
+
+  // find logical insertion index: times[i-1] < t <= times[i]
+  int i = historyFindIndex(times, n, cursor, t);
+
+  // exact match at logical i: return pointer to existing slot
+  if (i < n) {
+    int phys_i = historyPhysicalIndex(cursor, n, i);
+    if (sim_math_abs(t - times[phys_i]) < SIM_MINVAL) {
+      return values + phys_i*dim;
+    }
+  }
+
+  // logical i == 0: new sample is older than oldest, replace oldest slot
+  if (i == 0) {
+    int oldest_phys = historyPhysicalIndex(cursor, n, 0);
+    times[oldest_phys] = t;
+    return values + oldest_phys*dim;
+  }
+
+  // logical i == n: new sample is newer than newest, advance cursor and write
+  if (i == n) {
+    cursor = (cursor + 1) % n;
+    buf[1] = (sim_scalar_t)cursor;
+
+    // cursor now points to the new newest slot (which was the old oldest)
+    times[cursor] = t;
+    return values + cursor*dim;
+  }
+
+  // 0 < i < n: out-of-order insertion, shift [1, i-1] left (dropping 0), insert at i-1
+  for (int j = 0; j < i-1; j++) {
+    int src_phys = historyPhysicalIndex(cursor, n, j+1);
+    int dst_phys = historyPhysicalIndex(cursor, n, j);
+    times[dst_phys] = times[src_phys];
+    sim_math_copy(values + dst_phys*dim, values + src_phys*dim, dim);
+  }
+  int insert_phys = historyPhysicalIndex(cursor, n, i-1);
+  times[insert_phys] = t;
+  return values + insert_phys*dim;
+}
+
+
+// read vector value at time t; interp: 0=zero-order-hold, 1=linear, 2=cubic spline
+// returns pointer to sample in buffer on exact match or ZOH (res untouched)
+// returns NULL and writes interpolated result to res on interpolation
+const sim_scalar_t* sim_math_historyRead(const sim_scalar_t* buf, int n, int dim, sim_scalar_t* res, sim_scalar_t t, int interp) {
+  int cursor = (int)buf[1];
+  const sim_scalar_t* times = buf + 2;
+  const sim_scalar_t* values = buf + 2 + n;
+
+  int oldest_phys = historyPhysicalIndex(cursor, n, 0);
+  int newest_phys = historyPhysicalIndex(cursor, n, n-1);
+  sim_scalar_t t_oldest = times[oldest_phys];
+  sim_scalar_t t_newest = times[newest_phys];
+
+  // extrapolate before oldest: return pointer to oldest value
+  if (t <= t_oldest + SIM_MINVAL) {
+    return values + oldest_phys*dim;
+  }
+
+  // extrapolate after newest: return pointer to newest value
+  if (t >= t_newest - SIM_MINVAL) {
+    return values + newest_phys*dim;
+  }
+
+  // find bracketing logical index: times[i-1] < t <= times[i]
+  int i = historyFindIndex(times, n, cursor, t);
+  int phys_i = historyPhysicalIndex(cursor, n, i);
+
+  // check for exact match at i
+  if (sim_math_abs(t - times[phys_i]) < SIM_MINVAL) {
+    return values + phys_i*dim;
+  }
+
+  // lo = i-1, hi = i (we know i > 0 because t > t_oldest)
+  int phys_lo = historyPhysicalIndex(cursor, n, i-1);
+  int phys_hi = phys_i;
+
+  // zero-order hold: return pointer to lo (most recent sample <= t)
+  if (interp == 0) {
+    return values + phys_lo*dim;
+  }
+
+  sim_scalar_t dt = times[phys_hi] - times[phys_lo];
+  sim_scalar_t alpha = (t - times[phys_lo]) / dt;
+
+  // piecewise linear interpolation
+  if (interp == 1) {
+    for (int d = 0; d < dim; d++) {
+      res[d] = values[phys_lo*dim+d] + alpha * (values[phys_hi*dim+d] - values[phys_lo*dim+d]);
+    }
+  }
+
+  // cubic spline interpolation
+  else {
+    // Hermite basis functions
+    sim_scalar_t alpha2 = alpha * alpha;
+    sim_scalar_t alpha3 = alpha2 * alpha;
+    sim_scalar_t h00 = 2*alpha3 - 3*alpha2 + 1;
+    sim_scalar_t h10 = alpha3 - 2*alpha2 + alpha;
+    sim_scalar_t h01 = -2*alpha3 + 3*alpha2;
+    sim_scalar_t h11 = alpha3 - alpha2;
+
+    for (int d = 0; d < dim; d++) {
+      // finite differenced catmull-rom slopes, 0 at endpoints (constant extrapolation)
+
+      sim_scalar_t m_lo = 0;
+      if (i > 1) {
+        int phys_lo_prev = historyPhysicalIndex(cursor, n, i-2);
+        sim_scalar_t dt_lo = times[phys_hi] - times[phys_lo_prev];
+        m_lo = (values[phys_hi*dim+d] - values[phys_lo_prev*dim+d]) / dt_lo;
+      }
+
+      sim_scalar_t m_hi = 0;
+      if (i < n - 1) {
+        int phys_hi_next = historyPhysicalIndex(cursor, n, i+1);
+        sim_scalar_t dt_hi = times[phys_hi_next] - times[phys_lo];
+        m_hi = (values[phys_hi_next*dim+d] - values[phys_lo*dim+d]) / dt_hi;
+      }
+
+      res[d] = h00 * values[phys_lo*dim+d] +
+               h10 * dt * m_lo +
+               h01 * values[phys_hi*dim+d] +
+               h11 * dt * m_hi;
+    }
+  }
+
+  return NULL;
+}
+
+
+//------------------------------ miscellaneous -----------------------------------------------------
+
+// convert contact force to pyramid representation
+// the pyramid frame is: V0_i = N + mu_i*T_i
+//                       V1_i = N - mu_i*T_i
+void sim_math_encodePyramid(sim_scalar_t* pyramid, const sim_scalar_t* force, const sim_scalar_t* mu, int dim) {
+  sim_scalar_t a = force[0]/(dim-1), b;
+
+  // arbitrary redundancy resolution:
+  //  pyramid0_i + pyramid1_i = force_normal/(dim-1) = a
+  //  pyramid0_i - pyramid1_i = force_tangent_i/mu_i = b
+  for (int i=0; i < dim-1; i++) {
+    b = sim_math_min(a, force[i+1]/mu[i]);
+    pyramid[2*i] = 0.5*(a+b);
+    pyramid[2*i+1] = 0.5*(a-b);
+  }
+}
+
+
+// convert pyramid representation to contact force
+void sim_math_decodePyramid(sim_scalar_t* force, const sim_scalar_t* pyramid, const sim_scalar_t* mu, int dim) {
+  // special handling of frictionless contacts
+  if (dim == 1) {
+    force[0] = pyramid[0];
+    return;
+  }
+
+  // force_normal = sum(pyramid0_i + pyramid1_i)
+  force[0] = 0;
+  for (int i=0; i < 2*(dim-1); i++) {
+    force[0] += pyramid[i];
+  }
+
+  // force_tangent_i = (pyramid0_i - pyramid1_i) * mu_i
+  for (int i=0; i < dim-1; i++) {
+    force[i+1] = (pyramid[2*i] - pyramid[2*i+1]) * mu[i];
+  }
+}
+
+
+// integrate spring-damper analytically, return pos(t)
+sim_scalar_t sim_math_springDamper(sim_scalar_t pos0, sim_scalar_t vel0, sim_scalar_t k, sim_scalar_t b, sim_scalar_t t) {
+  sim_scalar_t det, c1, c2, r1, r2, w;
+
+  // determinant of characteristic equation
+  det = b*b - 4*k;
+
+  // overdamping
+  //  pos(t) = c1*exp(r1*t) + c2*exp(r2*t);  r12 = (-b +- sqrt(det))/2
+  if (det > SIM_MINVAL) {
+    // compute w = sqrt(det)/2
+    w = sim_math_sqrt(det)/2;
+
+    // compute r1,r2
+    r1 = -b/2 + w;
+    r2 = -b/2 - w;
+
+    // compute coefficients
+    c1 = (pos0*r2-vel0) / (r2-r1);
+    c2 = (pos0*r1-vel0) / (r1-r2);
+
+    // evaluate result
+    return c1*sim_math_exp(r1*t) + c2*sim_math_exp(r2*t);
+  }
+
+  // critical damping
+  //  pos(t) = exp(-b*t/2) * (c1 + c2*t)
+  else if (det <= SIM_MINVAL && det >= -SIM_MINVAL) {
+    // compute coefficients
+    c1 = pos0;
+    c2 = vel0 + b*c1/2;
+
+    // evaluate result
+    return sim_math_exp(-b*t/2) * (c1 + c2*t);
+  }
+
+  // underdamping
+  //  pos(t) = exp(-b*t/2) * (c1*cos(w*t) + c2*sin(w*t));  w = sqrt(abs(det))/2
+  else {
+    // compute w
+    w = sim_math_sqrt(sim_math_abs(det))/2;
+
+    // compute coefficients
+    c1 = pos0;
+    c2 = (vel0 + b*c1/2)/w;
+
+    // evaluate result
+    return sim_math_exp(-b*t/2) * (c1*sim_math_cos(w*t) + c2*sim_math_sin(w*t));
+  }
+}
+
+
+// return 1 if point is outside box given by pos, mat, size * inflate
+// return -1 if point is inside box given by pos, mat, size / inflate
+// return 0 if point is between the inflated and deflated boxes
+int sim_math_outsideBox(const sim_scalar_t point[3], const sim_scalar_t pos[3], const sim_scalar_t mat[9],
+                   const sim_scalar_t size[3], sim_scalar_t inflate) {
+  // check inflation coefficient
+  if (inflate < 1) {
+    SIM_ERROR("inflation coefficient must be >= 1")
+  }
+
+  // vector from pos to point, projected to box frame
+  sim_scalar_t vec[3] = {point[0]-pos[0], point[1]-pos[1], point[2]-pos[2]};
+  sim_math_mulMatTVec3(vec, mat, vec);
+
+  // big: inflated box
+  sim_scalar_t big[3] = {size[0], size[1], size[2]};
+  if (inflate > 1) {
+    sim_math_scale_3(big, big, inflate);
+  }
+
+  // check if outside big box
+  if (vec[0] > big[0] || vec[0] < -big[0] ||
+      vec[1] > big[1] || vec[1] < -big[1] ||
+      vec[2] > big[2] || vec[2] < -big[2]) {
+    return 1;
+  }
+
+  // quick return if no inflation
+  if (inflate == 1) {
+    return -1;
+  }
+
+  // check if inside small (deflated) box
+  sim_scalar_t small[3] = {size[0]/inflate, size[1]/inflate, size[2]/inflate};
+  if (vec[0] < small[0] && vec[0] > -small[0] &&
+      vec[1] < small[1] && vec[1] > -small[1] &&
+      vec[2] < small[2] && vec[2] > -small[2]) {
+    return -1;
+  }
+
+  // within margin between small and big box
+  return 0;
+}
+
+
+// print matrix to screen
+void sim_math_printMat(const sim_scalar_t* mat, int nr, int nc) {
+  for (int r=0; r < nr; r++) {
+    for (int c=0; c < nc; c++) {
+      printf("%.8f ", mat[r*nc+c]);
+    }
+    printf("\n");
+  }
+  printf("\n");
+}
+
+
+// print sparse matrix to screen
+void sim_math_printMatSparse(const sim_scalar_t* mat, int nr,
+                        const int* rownnz, const int* rowadr,
+                        const int* colind) {
+  for (int r=0; r < nr; r++) {
+    for (int adr=rowadr[r]; adr < rowadr[r]+rownnz[r]; adr++) {
+      printf("(%d %d): %9.6f  ", r, colind[adr], mat[adr]);
+    }
+    printf("\n");
+  }
+  printf("\n");
+}
+
+
+// min function, avoid re-evaluation
+sim_scalar_t sim_math_min(sim_scalar_t a, sim_scalar_t b) {
+  if (a <= b) {
+    return a;
+  } else {
+    return b;
+  }
+}
+
+
+// max function, avoid re-evaluation
+sim_scalar_t sim_math_max(sim_scalar_t a, sim_scalar_t b) {
+  if (a >= b) {
+    return a;
+  } else {
+    return b;
+  }
+}
+
+
+// clip x to the range [min, max]
+sim_scalar_t sim_math_clip(sim_scalar_t x, sim_scalar_t min, sim_scalar_t max) {
+  if (x < min) {
+    return min;
+  } else if (x > max) {
+    return max;
+  } else {
+    return x;
+  }
+}
+
+
+// sign function
+sim_scalar_t sim_math_sign(sim_scalar_t x) {
+  if (x < 0) {
+    return -1;
+  } else if (x > 0) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+
+// round to nearest integer
+int sim_math_round(sim_scalar_t x) {
+  sim_scalar_t lower = floor(x);
+  sim_scalar_t upper = ceil(x);
+
+  if (x-lower < upper-x) {
+    return (int)lower;
+  } else {
+    return (int)upper;
+  }
+}
+
+
+// convert type id to type name
+const char* sim_math_type2Str(int type) {
+  switch ((sim_obj_t) type) {
+  case SIM_OBJ_BODY:
+    return "body";
+
+  case SIM_OBJ_XBODY:
+    return "xbody";
+
+  case SIM_OBJ_JOINT:
+    return "joint";
+
+  case SIM_OBJ_DOF:
+    return "dof";
+
+  case SIM_OBJ_GEOM:
+    return "geom";
+
+  case SIM_OBJ_SITE:
+    return "site";
+
+  case SIM_OBJ_CAMERA:
+    return "camera";
+
+  case SIM_OBJ_LIGHT:
+    return "light";
+
+  case SIM_OBJ_FLEX:
+    return "flex";
+
+  case SIM_OBJ_MESH:
+    return "mesh";
+
+  case SIM_OBJ_SKIN:
+    return "skin";
+
+  case SIM_OBJ_HFIELD:
+    return "hfield";
+
+  case SIM_OBJ_TEXTURE:
+    return "texture";
+
+  case SIM_OBJ_MATERIAL:
+    return "material";
+
+  case SIM_OBJ_PAIR:
+    return "pair";
+
+  case SIM_OBJ_EXCLUDE:
+    return "exclude";
+
+  case SIM_OBJ_EQUALITY:
+    return "equality";
+
+  case SIM_OBJ_TENDON:
+    return "tendon";
+
+  case SIM_OBJ_ACTUATOR:
+    return "actuator";
+
+  case SIM_OBJ_SENSOR:
+    return "sensor";
+
+  case SIM_OBJ_NUMERIC:
+    return "numeric";
+
+  case SIM_OBJ_TEXT:
+    return "text";
+
+  case SIM_OBJ_TUPLE:
+    return "tuple";
+
+  case SIM_OBJ_KEY:
+    return "key";
+
+  case SIM_OBJ_PLUGIN:
+    return "plugin";
+
+  case SIM_OBJ_FRAME:
+    return "frame";
+
+  default:
+    return 0;
+  }
+}
+
+
+// convert type id to type name
+int sim_math_str2Type(const char* str) {
+  if (!strcmp(str, "body")) {
+    return SIM_OBJ_BODY;
+  }
+
+  else if (!strcmp(str, "xbody")) {
+    return SIM_OBJ_XBODY;
+  }
+
+  else if (!strcmp(str, "joint")) {
+    return SIM_OBJ_JOINT;
+  }
+
+  else if (!strcmp(str, "dof")) {
+    return SIM_OBJ_DOF;
+  }
+
+  else if (!strcmp(str, "geom")) {
+    return SIM_OBJ_GEOM;
+  }
+
+  else if (!strcmp(str, "site")) {
+    return SIM_OBJ_SITE;
+  }
+
+  else if (!strcmp(str, "camera")) {
+    return SIM_OBJ_CAMERA;
+  }
+
+  else if (!strcmp(str, "light")) {
+    return SIM_OBJ_LIGHT;
+  }
+
+  else if (!strcmp(str, "flex")) {
+    return SIM_OBJ_FLEX;
+  }
+
+  else if (!strcmp(str, "mesh")) {
+    return SIM_OBJ_MESH;
+  }
+
+  else if (!strcmp(str, "skin")) {
+    return SIM_OBJ_SKIN;
+  }
+
+  else if (!strcmp(str, "hfield")) {
+    return SIM_OBJ_HFIELD;
+  }
+
+  else if (!strcmp(str, "texture")) {
+    return SIM_OBJ_TEXTURE;
+  }
+
+  else if (!strcmp(str, "material")) {
+    return SIM_OBJ_MATERIAL;
+  }
+
+  else if (!strcmp(str, "pair")) {
+    return SIM_OBJ_PAIR;
+  }
+
+  else if (!strcmp(str, "exclude")) {
+    return SIM_OBJ_EXCLUDE;
+  }
+
+  else if (!strcmp(str, "equality")) {
+    return SIM_OBJ_EQUALITY;
+  }
+
+  else if (!strcmp(str, "tendon")) {
+    return SIM_OBJ_TENDON;
+  }
+
+  else if (!strcmp(str, "actuator")) {
+    return SIM_OBJ_ACTUATOR;
+  }
+
+  else if (!strcmp(str, "sensor")) {
+    return SIM_OBJ_SENSOR;
+  }
+
+  else if (!strcmp(str, "numeric")) {
+    return SIM_OBJ_NUMERIC;
+  }
+
+  else if (!strcmp(str, "text")) {
+    return SIM_OBJ_TEXT;
+  }
+
+  else if (!strcmp(str, "tuple")) {
+    return SIM_OBJ_TUPLE;
+  }
+
+  else if (!strcmp(str, "key")) {
+    return SIM_OBJ_KEY;
+  }
+
+  else if (!strcmp(str, "plugin")) {
+    return SIM_OBJ_PLUGIN;
+  }
+
+  else {
+    return SIM_OBJ_UNKNOWN;
+  }
+}
+
+
+// return human readable number of bytes using standard letter suffix
+const char* sim_math_writeNumBytes(size_t nbytes) {
+  int i;
+  static SIM_THREADLOCAL char message[20];
+  static const char suffix[] = " KMGTPE";
+  for (i=0; i < 6; i++) {
+    const size_t bits = (size_t)(1) << (10*(6-i));
+    if (nbytes >= bits && !(nbytes & (bits - 1))) {
+      break;
+    }
+  }
+  if (i < 6) {
+    SIM_SNPRINTF(message, "%zu%c", nbytes >> (10*(6-i)), suffix[6-i]);
+  } else {
+    SIM_SNPRINTF(message, "%zu", nbytes >> (10*(6-i)));
+  }
+  return message;
+}
+
+
+// warning text
+const char* sim_math_warningText(int warning, size_t info) {
+  static SIM_THREADLOCAL char str[1000];
+
+  switch ((SIM_tWarning) warning) {
+  case SIM_WARN_INERTIA:
+    SIM_SNPRINTF(str, "Inertia matrix is too close to singular at DOF %zu. Check model.", info);
+    break;
+
+  case SIM_WARN_CONTACTFULL:
+    SIM_SNPRINTF(str,
+               "Too many contacts. The arena memory is full, increase arena memory allocation."
+               "(ncon = %zu)", info);
+    break;
+
+  case SIM_WARN_CNSTRFULL:
+    SIM_SNPRINTF(str,
+               "Insufficient arena memory for the number of constraints generated. "
+               "Increase arena memory allocation above %s bytes.", sim_math_writeNumBytes(info));
+    break;
+
+  case SIM_WARN_VGEOMFULL:
+    SIM_SNPRINTF(str, "Pre-allocated visual geom buffer is full. Increase maxgeom above %zu.", info);
+    break;
+
+  case SIM_WARN_BADQPOS:
+    SIM_SNPRINTF(str, "Nan, Inf or huge value in QPOS at DOF %zu. The simulation is unstable.", info);
+    break;
+
+  case SIM_WARN_BADQVEL:
+    SIM_SNPRINTF(str, "Nan, Inf or huge value in QVEL at DOF %zu. The simulation is unstable.", info);
+    break;
+
+  case SIM_WARN_BADQACC:
+    SIM_SNPRINTF(str, "Nan, Inf or huge value in QACC at DOF %zu. The simulation is unstable.", info);
+    break;
+
+  case SIM_WARN_BADCTRL:
+    SIM_SNPRINTF(str, "Nan, Inf or huge value in CTRL at ACTUATOR %zu. The simulation is unstable.",
+               info);
+    break;
+
+  default:
+    SIM_SNPRINTF(str, "Unknown warning type %d.", warning);
+  }
+
+  return str;
+}
+
+
+// return 1 if nan or abs(x)>SIM_MAXVAL, 0 otherwise
+int sim_math_isBad(sim_scalar_t x) {
+  return (x != x || x > SIM_MAXVAL || x < -SIM_MAXVAL);
+}
+
+
+// return 1 if all elements are 0
+int sim_math_isZero(const sim_scalar_t* vec, int n) {
+  for (int i=0; i < n; i++) {
+    if (vec[i] != 0) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+
+// return 1 if all elements are 0
+int sim_math_isZeroByte(const unsigned char* vec, int n) {
+  if (!n || *vec) return !n;
+  return memcmp(vec, vec + 1, n - 1) == 0;
+}
+
+
+// set integer vector to 0
+void sim_math_zeroInt(int* res, int n) {
+  memset(res, 0, n*sizeof(int));
+}
+
+
+// copy int vector vec into res
+void sim_math_copyInt(int* res, const int* vec, int n) {
+  memcpy(res, vec, n*sizeof(int));
+}
+
+// fill int vector with val
+void sim_math_fillInt(int* res, int val, int n) {
+  for (int i = 0; i < n; i++) {
+    res[i] = val;
+  }
+}
+
+// standard normal random number generator (optional second number)
+sim_scalar_t sim_math_standardNormal(sim_scalar_t* num2) {
+  const sim_scalar_t scale = 2.0/((sim_scalar_t)RAND_MAX);
+  sim_scalar_t x1, x2, w;
+
+  do {
+    x1 = scale * (sim_scalar_t)rand() - 1.0;
+    x2 = scale * (sim_scalar_t)rand() - 1.0;
+    w = x1 * x1 + x2 * x2;
+  } while (w >= 1.0 || w == 0);
+
+  w = sim_math_sqrt((-2.0 * sim_math_log(w)) / w);
+  if (num2) {
+    *num2 = x2 * w;
+  }
+
+  return (x1 * w);
+}
+
+
+// convert from float to sim_scalar_t
+void sim_math_f2n(sim_scalar_t* res, const float* vec, int n) {
+  for (int i=0; i < n; i++) {
+    res[i] = (sim_scalar_t) vec[i];
+  }
+}
+
+
+// convert from sim_scalar_t to float
+void sim_math_n2f(float* res, const sim_scalar_t* vec, int n) {
+  for (int i=0; i < n; i++) {
+    res[i] = (float) vec[i];
+  }
+}
+
+
+// convert from double to sim_scalar_t
+void sim_math_d2n(sim_scalar_t* res, const double* vec, int n) {
+  for (int i=0; i < n; i++) {
+    res[i] = (sim_scalar_t) vec[i];
+  }
+}
+
+
+// convert from sim_scalar_t to double
+void sim_math_n2d(double* res, const sim_scalar_t* vec, int n) {
+  for (int i=0; i < n; i++) {
+    res[i] = (double) vec[i];
+  }
+}
+
+
+// gather
+void sim_math_gather(sim_scalar_t* restrict res, const sim_scalar_t* restrict vec, const int* restrict ind, int n) {
+  for (int i=0; i < n; i++) {
+    res[i] = vec[ind[i]];
+  }
+}
+
+
+// masked gather (set to 0 at negative indices)
+void sim_math_gatherMasked(sim_scalar_t* restrict res, const sim_scalar_t* restrict vec,
+                      const int* restrict ind, int n) {
+  for (int i=0; i < n; i++) {
+    res[i] = ind[i] >= 0 ? vec[ind[i]] : 0;
+  }
+}
+
+
+// scatter
+void sim_math_scatter(sim_scalar_t* restrict res, const sim_scalar_t* restrict vec, const int* restrict ind, int n) {
+  for (int i=0; i < n; i++) {
+    res[ind[i]] = vec[i];
+  }
+}
+
+
+// gather integers
+void sim_math_gatherInt(int* restrict res, const int* restrict vec, const int* restrict ind, int n) {
+  for (int i=0; i < n; i++) {
+    res[i] = vec[ind[i]];
+  }
+}
+
+
+// scatter integers
+void sim_math_scatterInt(int* restrict res, const int* restrict vec, const int* restrict ind, int n) {
+  for (int i=0; i < n; i++) {
+    res[ind[i]] = vec[i];
+  }
+}
+
+
+// build gather indices mapping src to res, assumes pattern(res) \subseteq pattern(src)
+void sim_math_sparseMap(int* map, int nr,
+                   const int* res_rowadr, const int* res_rownnz, const int* res_colind,
+                   const int* src_rowadr, const int* src_rownnz, const int* src_colind) {
+  for (int i = 0; i < nr; i++) {
+    int res_cursor = res_rowadr[i];
+    int res_end    = res_cursor + res_rownnz[i];
+    int src_cursor = src_rowadr[i];
+    int src_end    = src_cursor + src_rownnz[i];
+
+    while (res_cursor < res_end) {
+      int res_col = res_colind[res_cursor];
+      while (src_cursor < src_end && src_colind[src_cursor] < res_col) {
+        src_cursor++;
+      }
+
+      // found match, set index and advance cursors
+      map[res_cursor++] = src_cursor++;
+    }
+  }
+}
+
+
+// build masked-gather map to copy a lower-triangular src into symmetric res
+//  `cursor` is a preallocated buffer of size `nr`
+void sim_math_lower2SymMap(int* map, int nr,
+                      const int* res_rowadr, const int* res_rownnz, const int* res_colind,
+                      const int* src_rowadr, const int* src_rownnz, const int* src_colind,
+                      int* cursor) {
+  if (!nr) return;
+
+  // default all map entries to "no source"
+  int nnz = res_rowadr[nr-1] + res_rownnz[nr-1];
+  sim_math_fillInt(map, -1, nnz);
+
+  // initialize per-row cursor
+  for (int i = 0; i < nr; i++) {
+    cursor[i] = res_rowadr[i];
+  }
+
+  // sweep src rows; for each lower (i,j) set res(i,j) and res(j,i)
+  for (int i = 0; i < nr; i++) {
+    int src_start = src_rowadr[i];
+    int src_end   = src_start + src_rownnz[i];
+
+    // sweep src row
+    for (int k = src_start; k < src_end; k++) {
+      int j = src_colind[k];
+      if (j > i) break;  // use only lower triangle of src
+
+      // --- lower triangle: res(i, j)
+      int res_start = res_rowadr[i];
+      int res_end   = res_start + res_rownnz[i];
+      int c         = cursor[i];
+
+      // increment c until there is a match
+      while (c < res_end && res_colind[c] < j) c++;
+
+      // found match, set index, advance and save cursor
+      if (c < res_end && res_colind[c] == j) {
+        map[c] = k;
+        c++;
+      }
+      cursor[i] = c;
+
+
+      // --- upper mirror: res(j, i)
+      if (j != i) {
+        res_start = res_rowadr[j];
+        res_end   = res_start + res_rownnz[j];
+        c         = cursor[j];
+
+        // increment c until there is a match
+        while (c < res_end && res_colind[c] < i) c++;
+
+        // found match, set index and advance and save cursor
+        if (c < res_end && res_colind[c] == i) {
+          map[c] = k;
+          c++;
+        }
+        cursor[j] = c;
+      }
+    }
+  }
+}
+
+
+// insertion sort, increasing order
+void sim_math_insertionSort(sim_scalar_t* list, int n) {
+  for (int i=1; i < n; i++) {
+    sim_scalar_t x = list[i];
+    int j = i-1;
+    while (j >= 0 && list[j] > x) {
+      list[j+1] = list[j];
+      j--;
+    }
+    list[j+1] = x;
+  }
+}
+
+
+// integer insertion sort, increasing order
+void sim_math_insertionSortInt(int* list, int n) {
+  for (int i=1; i < n; i++) {
+    int x = list[i];
+    int j = i-1;
+    while (j >= 0 && list[j] > x) {
+      list[j+1] = list[j];
+      j--;
+    }
+    list[j+1] = x;
+  }
+}
+
+
+// Halton sequence
+sim_scalar_t sim_math_Halton(int index, int base) {
+  int n0 = index;
+  sim_scalar_t b = (sim_scalar_t)base;
+  sim_scalar_t f = 1/b, hn = 0;
+
+  while (n0 > 0) {
+    int n1 = n0/base;
+    int r = n0 - n1*base;
+    hn += f*r;
+    f /= b;
+    n0 = n1;
+  }
+
+  return hn;
+}
+
+
+// Call strncpy, then set dst[n-1] = 0.
+char* sim_math_strncpy(char *dst, const char *src, int n) {
+  if (dst && src && n > 0) {
+    strncpy(dst, src, n);
+    dst[n-1] = 0;
+  }
+
+  return dst;
+}
+
+
+// sigmoid function over 0<=x<=1 using quintic polynomial
+sim_scalar_t sim_math_sigmoid(sim_scalar_t x) {
+  // fast return
+  if (x <= 0) {
+    return 0;
+  }
+  if (x >= 1) {
+    return 1;
+  }
+
+  // sigmoid: f(x) = 6*x^5 - 15*x^4 + 10*x^3
+  // solution of f(0) = f'(0) = f''(0) = 0, f(1) = 1, f'(1) = f''(1) = 0
+  return x*x*x * (3*x * (2*x - 5) + 10);
+}
