@@ -16,6 +16,7 @@
 #include <array>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <csetjmp>
 #include <cstddef>
 #include <cstdio>
@@ -393,7 +394,15 @@ void sim_builder_mesh_t::LoadSDF() {
   pplugin->sdf_aabb(aabb, attributes.data());
   sim_scalar_t total = aabb[3] + aabb[4] + aabb[5];
 
-  const double n = 1024;
+  // Keep default SDF mesh sampling budget aligned with MuJoCo gear baseline exports.
+  double n = 300;
+  if (const char* env = std::getenv("SIM_SDF_MESH_SAMPLES")) {
+    char* end = nullptr;
+    const double parsed = std::strtod(env, &end);
+    if (end != env && parsed > 0) {
+      n = parsed;
+    }
+  }
   int nx, ny, nz;
   nx = floor(n / total * aabb[3]) + 1;
   ny = floor(n / total * aabb[4]) + 1;

@@ -75,6 +75,7 @@ add_subdirectory(src/engine)
 add_subdirectory(src/user)
 add_subdirectory(src/xml)
 add_subdirectory(src/thread)
+add_subdirectory(src/plugin)
 
 target_compile_definitions(
   simcore
@@ -138,6 +139,14 @@ if(SIMCORE_BUILD_SMOKE)
   add_executable(simcore_p7_foundation_math_smoke tests/p7_foundation_math_smoke.c)
   target_include_directories(simcore_p7_foundation_math_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(simcore_p7_foundation_math_smoke PRIVATE simcore)
+endif()
+
+option(SIMCORE_BUILD_GEAR_EXPORT_CPP "Build C++ gear CSV export executable" ON)
+if(SIMCORE_BUILD_GEAR_EXPORT_CPP)
+  add_executable(simcore_gear_export tools/gear_contact_export_cpp.cc)
+  target_compile_features(simcore_gear_export PRIVATE cxx_std_17)
+  target_include_directories(simcore_gear_export PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(simcore_gear_export PRIVATE simcore)
 endif()
 
 set_target_properties(
