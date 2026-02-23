@@ -1,0 +1,20 @@
+<simcore model="double_pendulum">
+  <option timestep="0.001" gravity="0 -9.81 0"/>
+  
+  <worldbody>
+    <body name="Body1" pos="0.5 0 0">
+      <inertial mass="1" diaginertia="1 1 1" pos="0 0 0"/>
+      <joint name="RevJoint1" type="hinge" pos="-0.5 0 0" axis="0 0 1"/>
+      <site name="acc_site" pos="0 0 0"/>
+      
+      <body name="Body2" pos="1 0 0">
+        <inertial mass="1" diaginertia="1 1 1" pos="0 0 0"/>
+        <joint name="RevJoint2" type="hinge" pos="-0.5 0 0" axis="0 0 1"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <sensor>
+    <accelerometer name="dummy" site="acc_site"/>
+  </sensor>
+</simcore>

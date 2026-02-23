@@ -149,6 +149,14 @@ if(SIMCORE_BUILD_GEAR_EXPORT_CPP)
   target_link_libraries(simcore_gear_export PRIVATE simcore)
 endif()
 
+option(SIMCORE_BUILD_DOUBLE_PENDULUM_SIM "Build double_pendulum simulation tool" ON)
+if(SIMCORE_BUILD_DOUBLE_PENDULUM_SIM)
+  add_executable(double_pendulum_sim tools/double_pendulum_sim.cc)
+  target_compile_features(double_pendulum_sim PRIVATE cxx_std_17)
+  target_include_directories(double_pendulum_sim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(double_pendulum_sim PRIVATE simcore)
+endif()
+
 set_target_properties(
   simcore
   PROPERTIES OUTPUT_NAME "simcore"
