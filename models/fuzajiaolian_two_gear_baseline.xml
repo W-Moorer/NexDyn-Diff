@@ -1,0 +1,44 @@
+<simcore model="fuzajiaolian">
+  <compiler angle="radian" autolimits="true" boundmass="1e-8" boundinertia="1e-12"/>
+  <size nconmax="10000" memory="100M"/>
+  <!-- Units from RMD: length=Millimeter, mass=Kilogram, time=Second, force=Newton -->
+  <option timestep="1e-05" gravity="0 0 0" sdf_iterations="80" sdf_initpoints="40"/>
+
+  <asset>
+    <mesh name="SWINGARM000_mesh" file="obj/SWINGARM000.obj" scale="0.001 0.001 0.001"/>
+    <mesh name="GEAR21_mesh" file="obj/GEAR21.obj" scale="0.001 0.001 0.001"/>
+    <mesh name="GEAR22_mesh" file="obj/GEAR22.obj" scale="0.001 0.001 0.001"/>
+  </asset>
+
+  <default>
+    <geom type="sdf" friction="0.16" solref="0.0001 2.0" solimp="0.99 0.999 0.0002 0.5 2"/>
+  </default>
+
+  <worldbody>
+    <body name="SWINGARM000" pos="0.0213424694907909 -3.11102883849488e-05 -0.00683071938187611">
+      <inertial mass="0.000349446153896465" diaginertia="3.22975036698429e-09 3.47338802961322e-09 5.11198686397215e-10" pos="0 0 0"/>
+      <joint name="RevJoint3" type="hinge" axis="1 0 0" pos="0.0016975305092191 4.11100788528068e-05 0.00278071905295011"/>
+      <geom name="geom_SWINGARM000" contype="0" conaffinity="0" mesh="SWINGARM000_mesh" pos="-0.0027324696744509 -0.00193868189724505 -0.00619028061838389" rgba="0.8 0.2 0.2 1"/>
+    </body>
+    <body name="GEAR21" pos="0.0209136192988016 0.000503589451286037 0.00136499444260163">
+      <inertial mass="0.000133136344904928" diaginertia="1.01373364551386e-10 2.28361045813721e-10 2.28351850267242e-10" pos="0 0 0"/>
+      <joint name="RevJoint1" type="hinge" axis="1 0 0" pos="0 0 0"/>
+      <geom name="geom_GEAR21" contype="2" conaffinity="4" mesh="GEAR21_mesh" pos="-0.0034536192988016 -0.00187013330434004 -0.00184379363961463" rgba="0.8 0.2 0.2 1"/>
+    </body>
+    <body name="GEAR22" pos="0.0209136192988086 0.000503589459392722 -0.00136500556929607">
+      <inertial mass="0.000133136344903739" diaginertia="1.0137339520582e-10 2.28361098940409e-10 2.28351827787442e-10" pos="0 0 0"/>
+      <joint name="RevJoint2" type="hinge" axis="1 0 0" pos="0 0 0"/>
+      <geom name="geom_GEAR22" contype="4" conaffinity="3" mesh="GEAR22_mesh" pos="-0.0034536192988086 -0.00187028917110972 -0.00184418898957093" rgba="0.8 0.2 0.2 1"/>
+    </body>
+  </worldbody>
+
+  <!-- Contact pairs parsed from RMD (mode=mask):
+       GeoSurContact1: geom_GEAR22 <-> geom_GEAR21
+       GeoSurContact2: geom_SWINGARM000 <-> geom_GEAR22
+  -->
+
+  <actuator>
+    <velocity name="RevJoint1.RMotion" joint="RevJoint1" kv="1e-06"/>
+  </actuator>
+  <!-- Motion target velocity from RMD function: 1 rad/s -->
+</simcore>

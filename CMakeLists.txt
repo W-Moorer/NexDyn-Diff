@@ -157,6 +157,14 @@ if(SIMCORE_BUILD_DOUBLE_PENDULUM_SIM)
   target_link_libraries(double_pendulum_sim PRIVATE simcore)
 endif()
 
+option(SIMCORE_BUILD_COMPLEX_GEAR_SIM "Build complex_gear simulation tool" ON)
+if(SIMCORE_BUILD_COMPLEX_GEAR_SIM)
+  add_executable(complex_gear_sim tools/complex_gear_sim.cc)
+  target_compile_features(complex_gear_sim PRIVATE cxx_std_17)
+  target_include_directories(complex_gear_sim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(complex_gear_sim PRIVATE simcore)
+endif()
+
 set_target_properties(
   simcore
   PROPERTIES OUTPUT_NAME "simcore"
