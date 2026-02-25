@@ -1,0 +1,32 @@
+<simcore model="slider_crank">
+  <compiler angle="radian" autolimits="true" boundmass="1e-8" boundinertia="1e-12"/>
+  <!-- RMD units are mm-kg-s; model values below keep the same unit system for direct CSV comparison. -->
+  <option timestep="0.001" gravity="0 0 0"/>
+
+  <worldbody>
+    <body name="Body1" pos="0 50 0">
+      <inertial mass="0.0616537558266997" diaginertia="51.7634658295 0.770671947833747 51.7634658295" pos="0 0 0"/>
+      <joint name="RevJoint1" type="hinge" pos="0 -50 0" axis="0 0 1"/>
+
+      <body name="Body2" pos="0 100 0">
+        <inertial mass="0.0616537558266997" diaginertia="51.7634658295 0.770671947833747 51.7634658295" pos="0 0 0"/>
+        <joint name="TraJoint2" type="slide" pos="0 -50 0" axis="0 1 0"/>
+
+        <body name="Body3" pos="50 50 0">
+          <inertial mass="0.0616537558266997" diaginertia="0.770671947833747 51.7634658295 51.7634658295" pos="0 0 0"/>
+          <joint name="RevJoint2" type="hinge" pos="-50 0 0" axis="0 0 -1"/>
+
+          <body name="Body4" pos="100 0 0">
+            <inertial mass="0.0616537558266997" diaginertia="0.770671947833747 51.7634658295 51.7634658295" pos="0 0 0"/>
+            <joint name="TraJoint1" type="slide" pos="-50 0 0" axis="-1 0 0"/>
+
+            <body name="Body5" pos="50 0 0">
+              <inertial mass="4.11025038844665" diaginertia="4110.25038844665 4110.25038844665 4110.25038844665" pos="0 0 0"/>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+</simcore>
